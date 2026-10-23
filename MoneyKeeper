@@ -1,0 +1,719 @@
+
+# 记账本（MoneyKeeper）
+
+简洁的安卓记账 App：Kotlin + SQLite 本地存储，无需联网，带桌面图标。
+
+## 功能
+- 记一笔：支出（餐饮/交通/购物）、收入（生活费/其他），金额/备注/日期
+- 按月统计：本月收入、本月支出、本月结余，可切换任意月份
+- 明细列表按日期倒序，长按删除
+- 绿色「¥」桌面图标
+
+## 如何安装到手机（拿到 APK 的两种方式）
+
+### 方式一：GitHub Actions 自动构建（推荐，不需要装任何环境）
+1. 在 GitHub 新建一个仓库，把本项目所有文件上传（或直接 `git push`）
+2. 打开仓库的 **Actions** 页面，工作流 "Build APK" 会自动运行
+3. 跑完后进入该工作流运行详情 → **Artifacts** → 下载 `moneykeeper-debug-apk`
+4. 把下载的 APK 传到安卓手机，点击安装（需在手机设置中允许“安装未知来源应用”）
+
+### 方式二：本地用 Android Studio 构建
+1. Android Studio 打开项目，等待 Gradle 同步完成
+2. 菜单 **Build → Build Bundle(s) / APK(s) → Build APK(s)**
+3. 完成后点提示中的 **locate**，得到 `app-debug.apk`，传到手机安装
+
+## 项目结构
+- `MainActivity.kt` — 主页：统计卡片 + 明细列表 + 记一笔对话框
+- `RecordAdapter.kt` — 明细列表适配器
+- `data/Record.kt` / `data/RecordDbHelper.kt` — 数据模型与 SQLite
+- `.github/workflows/build-apk.yml` — 自动构建 APK 的 CI 配置
+- `res/mipmap-*/ic_launcher.png` — 桌面图标
+
+
+org.gradle.jvmargs=-Xmx2048m
+android.useAndroidX=true
+kotlin.code.style=official
+android.nonTransitiveRClass=true
+
+
+// Top-level build file
+
+
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "MoneyKeeper"
+include(":app")
+
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Accept licenses & build
+        run: |
+          yes | sdkmanager --licenses || true
+          gradle wrapper
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: moneykeeper-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.example.moneykeeper"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.example.moneykeeper"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildFeatures {
+        viewBinding = true
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+}
+package com.example.moneykeeper
+
+import android.annotation.SuppressLint
+import android.app.DatePickerDialog
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.widget.ArrayAdapter
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.example.moneykeeper.data.Record
+import com.example.moneykeeper.data.RecordDbHelper
+import com.example.moneykeeper.databinding.ActivityMainBinding
+import com.example.moneykeeper.databinding.DialogAddBinding
+import java.text.DecimalFormat
+import java.util.Calendar
+
+class MainActivity : AppCompatActivity() {
+
+    companion object {
+        const val TYPE_EXPENSE = 0
+        const val TYPE_INCOME = 1
+        val EXPENSE_CATS = listOf("餐饮", "交通", "购物")
+        val INCOME_CATS = listOf("生活费", "其他")
+    }
+
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var db: RecordDbHelper
+    private lateinit var adapter: RecordAdapter
+    private val fmt = DecimalFormat("0.00")
+
+    private var calendar = Calendar.getInstance()
+    private var pickedDate: String = ""
+
+    private val currentMonth: String
+        get() = "%04d-%02d".format(calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH) + 1)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        setSupportActionBar(binding.toolbar)
+
+        db = RecordDbHelper(this)
+        adapter = RecordAdapter(emptyList()) { record -> confirmDelete(record) }
+
+        binding.recyclerView.layoutManager = LinearLayoutManager(this)
+        binding.recyclerView.adapter = adapter
+
+        binding.btnAdd.setOnClickListener { showAddDialog() }
+        binding.btnPrev.setOnClickListener { shiftMonth(-1) }
+        binding.btnNext.setOnClickListener { shiftMonth(1) }
+
+        pickedDate = today()
+        refresh()
+    }
+
+    private fun shiftMonth(delta: Int) {
+        calendar.add(Calendar.MONTH, delta)
+        refresh()
+    }
+
+    private fun refresh() {
+        binding.tvMonth.text = currentMonth
+        val (income, expense) = db.monthSummary(currentMonth)
+        binding.tvIncome.text = "本月收入：¥${fmt.format(income)}"
+        binding.tvExpense.text = "本月支出：¥${fmt.format(expense)}"
+        binding.tvBalance.text = "本月结余：¥${fmt.format(income - expense)}"
+        adapter.update(db.queryByMonth(currentMonth))
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun showAddDialog() {
+        val dialogBinding = DialogAddBinding.inflate(LayoutInflater.from(this))
+
+        // 分类随类型联动
+        val catAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, EXPENSE_CATS)
+        catAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        dialogBinding.spCategory.adapter = catAdapter
+
+        dialogBinding.rgType.setOnCheckedChangeListener { _, checkedId ->
+            val cats = if (checkedId == dialogBinding.rbIncome.id) INCOME_CATS else EXPENSE_CATS
+            val a = ArrayAdapter(this, android.R.layout.simple_spinner_item, cats)
+            a.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            dialogBinding.spCategory.adapter = a
+        }
+
+        pickedDate = today()
+        dialogBinding.btnDate.text = pickedDate
+        dialogBinding.btnDate.setOnClickListener {
+            val cal = Calendar.getInstance()
+            DatePickerDialog(
+                this,
+                { _, y, m, d ->
+                    pickedDate = "%04d-%02d-%02d".format(y, m + 1, d)
+                    dialogBinding.btnDate.text = pickedDate
+                },
+                cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)
+            ).show()
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("记一笔")
+            .setView(dialogBinding.root)
+            .setPositiveButton("保存") { _, _ ->
+                val type = if (dialogBinding.rgType.checkedRadioButtonId == dialogBinding.rbIncome.id)
+                    TYPE_INCOME else TYPE_EXPENSE
+                val category = dialogBinding.spCategory.selectedItem.toString()
+                val amountText = dialogBinding.etAmount.text.toString()
+                val amount = amountText.toDoubleOrNull()
+                if (amount == null || amount <= 0) {
+                    Toast.makeText(this, "请输入有效金额", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                val record = Record(
+                    type = type,
+                    category = category,
+                    amount = amount,
+                    note = dialogBinding.etNote.text.toString().trim(),
+                    date = pickedDate
+                )
+                db.insert(record)
+                // 记账后自动切换到该记录所在月份
+                calendar.set(
+                    pickedDate.substring(0, 4).toInt(),
+                    pickedDate.substring(5, 7).toInt() - 1,
+                    1
+                )
+                refresh()
+                Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun confirmDelete(record: Record) {
+        AlertDialog.Builder(this)
+            .setTitle("删除记录")
+            .setMessage("确定删除这条「${record.category} ¥${fmt.format(record.amount)}」的记录吗？")
+            .setPositiveButton("删除") { _, _ ->
+                db.delete(record.id)
+                refresh()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun today(): String {
+        val cal = Calendar.getInstance()
+        return "%04d-%02d-%02d".format(
+            cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH)
+        )
+    }
+}
+
+
+package com.example.moneykeeper
+
+import android.annotation.SuppressLint
+import android.graphics.Color
+import android.view.LayoutInflater
+import android.view.ViewGroup
+import androidx.recyclerview.widget.RecyclerView
+import com.example.moneykeeper.data.Record
+import com.example.moneykeeper.databinding.ItemRecordBinding
+import java.text.DecimalFormat
+
+class RecordAdapter(
+    private var records: List<Record>,
+    private val onLongClick: (Record) -> Unit
+) : RecyclerView.Adapter<RecordAdapter.VH>() {
+
+    private val fmt = DecimalFormat("0.00")
+
+    inner class VH(val binding: ItemRecordBinding) : RecyclerView.ViewHolder(binding.root)
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH =
+        VH(ItemRecordBinding.inflate(LayoutInflater.from(parent.context), parent, false))
+
+    override fun getItemCount(): Int = records.size
+
+    @SuppressLint("SetTextI18n")
+    override fun onBindViewHolder(holder: VH, position: Int) {
+        val r = records[position]
+        with(holder.binding) {
+            tvCategory.text = r.category
+            tvDate.text = r.date
+            tvNote.text = if (r.note.isBlank()) "" else r.note
+            if (r.type == 1) {
+                tvAmount.text = "+${fmt.format(r.amount)}"
+                tvAmount.setTextColor(Color.parseColor("#4CAF50"))
+            } else {
+                tvAmount.text = "-${fmt.format(r.amount)}"
+                tvAmount.setTextColor(Color.parseColor("#F44336"))
+            }
+            root.setOnLongClickListener {
+                onLongClick(r)
+                true
+            }
+        }
+    }
+
+    fun update(newList: List<Record>) {
+        records = newList
+        notifyDataSetChanged()
+    }
+}
+
+package com.example.moneykeeper.data
+
+data class Record(
+    val id: Long = 0,
+    val type: Int,        // 0 = 支出, 1 = 收入
+    val category: String, // 支出: 餐饮/交通/购物  收入: 生活费/其他
+    val amount: Double,
+    val note: String,
+    val date: String      // yyyy-MM-dd
+)
+
+
+package com.example.moneykeeper.data
+
+import android.content.ContentValues
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
+
+class RecordDbHelper(context: Context) :
+    SQLiteOpenHelper(context, DB_NAME, null, DB_VERSION) {
+
+    companion object {
+        const val DB_NAME = "money_keeper.db"
+        const val DB_VERSION = 1
+        const val TABLE = "records"
+        const val COL_ID = "id"
+        const val COL_TYPE = "type"
+        const val COL_CATEGORY = "category"
+        const val COL_AMOUNT = "amount"
+        const val COL_NOTE = "note"
+        const val COL_DATE = "date"
+    }
+
+    override fun onCreate(db: SQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE $TABLE (" +
+                "$COL_ID INTEGER PRIMARY KEY AUTOINCREMENT," +
+                "$COL_TYPE INTEGER NOT NULL," +
+                "$COL_CATEGORY TEXT NOT NULL," +
+                "$COL_AMOUNT REAL NOT NULL," +
+                "$COL_NOTE TEXT," +
+                "$COL_DATE TEXT NOT NULL)"
+        )
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        db.execSQL("DROP TABLE IF EXISTS $TABLE")
+        onCreate(db)
+    }
+
+    fun insert(record: Record): Long {
+        val values = ContentValues().apply {
+            put(COL_TYPE, record.type)
+            put(COL_CATEGORY, record.category)
+            put(COL_AMOUNT, record.amount)
+            put(COL_NOTE, record.note)
+            put(COL_DATE, record.date)
+        }
+        return writableDatabase.insert(TABLE, null, values)
+    }
+
+    fun delete(id: Long): Int =
+        writableDatabase.delete(TABLE, "$COL_ID=?", arrayOf(id.toString()))
+
+    /** 查询某个月(yyyy-MM)的所有记录，按日期倒序 */
+    fun queryByMonth(month: String): List<Record> {
+        val list = mutableListOf<Record>()
+        readableDatabase.query(
+            TABLE, null,
+            "$COL_DATE LIKE ?",
+            arrayOf("$month%"),
+            null, null,
+            "$COL_DATE DESC, $COL_ID DESC"
+        ).use { c ->
+            while (c.moveToNext()) {
+                list.add(
+                    Record(
+                        id = c.getLong(c.getColumnIndexOrThrow(COL_ID)),
+                        type = c.getInt(c.getColumnIndexOrThrow(COL_TYPE)),
+                        category = c.getString(c.getColumnIndexOrThrow(COL_CATEGORY)),
+                        amount = c.getDouble(c.getColumnIndexOrThrow(COL_AMOUNT)),
+                        note = c.getString(c.getColumnIndexOrThrow(COL_NOTE)) ?: "",
+                        date = c.getString(c.getColumnIndexOrThrow(COL_DATE))
+                    )
+                )
+            }
+        }
+        return list
+    }
+
+    /** 统计某月的总收入/总支出 */
+    fun monthSummary(month: String): Pair<Double, Double> {
+        var income = 0.0
+        var expense = 0.0
+        readableDatabase.rawQuery(
+            "SELECT $COL_TYPE, SUM($COL_AMOUNT) FROM $TABLE WHERE $COL_DATE LIKE ? GROUP BY $COL_TYPE",
+            arrayOf("$month%")
+        ).use { c ->
+            while (c.moveToNext()) {
+                if (c.getInt(0) == 1) income = c.getDouble(1) else expense = c.getDouble(1)
+            }
+        }
+        return income to expense
+    }
+}
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="记账本"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MoneyKeeper">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/bg">
+
+    <androidx.appcompat.widget.Toolbar
+        android:id="@+id/toolbar"
+        android:layout_width="match_parent"
+        android:layout_height="?attr/actionBarSize"
+        android:background="@color/primary"
+        android:titleTextColor="@android:color/white"
+        android:title="记账本" />
+
+    <!-- 月份切换 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:padding="8dp">
+
+        <Button
+            android:id="@+id/btnPrev"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="◀ 上月" />
+
+        <TextView
+            android:id="@+id/tvMonth"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:text="2026-10" />
+
+        <Button
+            android:id="@+id/btnNext"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="下月 ▶" />
+    </LinearLayout>
+
+    <!-- 月度统计卡片 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_margin="12dp"
+        android:padding="16dp"
+        android:background="@android:color/white"
+        android:elevation="4dp">
+
+        <TextView
+            android:id="@+id/tvIncome"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="本月收入：¥0.00"
+            android:textColor="@color/income"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/tvExpense"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="本月支出：¥0.00"
+            android:textColor="@color/expense"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/tvBalance"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="本月结余：¥0.00"
+            android:textStyle="bold"
+            android:textSize="18sp" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingHorizontal="16dp"
+        android:text="明细（长按可删除）"
+        android:textStyle="bold"
+        android:textSize="14sp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recyclerView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:padding="8dp" />
+
+    <Button
+        android:id="@+id/btnAdd"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="12dp"
+        android:text="＋ 记一笔" />
+
+</LinearLayout>
+
+
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <RadioGroup
+        android:id="@+id/rgType"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/rbExpense"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:checked="true"
+            android:text="支出" />
+
+        <RadioButton
+            android:id="@+id/rbIncome"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="收入" />
+    </RadioGroup>
+
+    <Spinner
+        android:id="@+id/spCategory"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp" />
+
+    <EditText
+        android:id="@+id/etAmount"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:hint="金额（元）"
+        android:inputType="numberDecimal" />
+
+    <EditText
+        android:id="@+id/etNote"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:hint="备注（可选）" />
+
+    <Button
+        android:id="@+id/btnDate"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="选择日期" />
+</LinearLayout>
+
+
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:padding="12dp"
+    android:layout_margin="4dp"
+    android:background="@android:color/white"
+    android:elevation="2dp">
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/tvCategory"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="餐饮"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvNote"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="备注"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/tvDate"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="2026-10-24"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/tvAmount"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="-25.00"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+</LinearLayout>
+
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="bg">#FFF5F6F8</color>
+    <color name="income">#FF4CAF50</color>
+    <color name="expense">#FFF44336</color>
+    <color name="primary">#FF3F51B5</color>
+</resources>
+
+
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">记账本</string>
+</resources>
+
+
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MoneyKeeper" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorSecondary">@color/teal_700</item>
+    </style>
+</resources>
+
